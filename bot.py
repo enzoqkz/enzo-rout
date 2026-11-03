@@ -13,18 +13,22 @@ from zoneinfo import ZoneInfo, available_timezones
 import aiohttp
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.filters import CommandStart, StateFilter
+from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import BotCommand, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 TOKEN = os.getenv("BOT_TOKEN")
 DEFAULT_TZ = os.getenv("DEFAULT_TZ", "Asia/Almaty")
 DB_PATH = os.getenv("DB_PATH", "bot.db")
 GEMINI_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-latest")
-DAYS = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+try:  # Telegram ID администратора (узнать: написать боту /id), сюда приходят сообщения из /help
+    ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or 0)
+except ValueError:
+    ADMIN_ID = 0
+DAYS =["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
 
 # ---------- база данных ----------
 db = sqlite3.connect(DB_PATH, isolation_level=None)
@@ -48,9 +52,10 @@ CREATE TABLE IF NOT EXISTS holidays(
 CREATE TABLE IF NOT EXISTS holiday_sync(user_id INTEGER PRIMARY KEY, synced_at TEXT, until TEXT);
 CREATE TABLE IF NOT EXISTS habits(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, title TEXT);
 CREATE TABLE IF NOT EXISTS habit_log(user_id INTEGER, habit_id INTEGER, day TEXT, PRIMARY KEY(user_id, habit_id, day));
+CREATE TABLE IF NOT EXISTS support(admin_msg_id INTEGER PRIMARY KEY, user_id INTEGER);
 """
 )
-for _col in ("hw_hour INTEGER DEFAULT 16", "grade INTEGER"):  # для баз, созданных старой версией бота
+for _col in ("hw_hour INTEGER DEFAULT 16", "grade INTEGER", "ask_hw INTEGER DEFAULT 1"):  # для баз, созданных старой версией бота
     try:
         db.execute(f"ALTER TABLE users ADD COLUMN {_col}")
     except sqlite3.OperationalError:
@@ -78,6 +83,7 @@ MAIN_KB = kb(
     [("💧 Вода", "water"), ("⚖️ ИМТ", "bmi")],
     [("📅 Расписание", "sched"), ("📚 Домашка", "hw")],
     [("✅ Чек-лист", "check"), ("⚙️ Настройки", "set")],
+    [("❓ Помощь", "help")],
 )
 
 
@@ -117,6 +123,7 @@ class S(StatesGroup):
     hw_task = State()
     hol = State()
     ck = State()
+    support = State()
 
 
 # ---------- старт и меню ----------
@@ -135,6 +142,87 @@ async def start(m: Message, state: FSMContext):
 async def menu(cb: CallbackQuery, state: FSMContext):
     await state.clear()
     await edit(cb, "Главное меню", MAIN_KB)
+
+
+# ---------- помощь, ID и связь с администратором ----------
+HELP_TEXT = (
+    "❓ Что умеет бот\n\n"
+    "💧 Вода: считает, сколько ты выпил за день.\n"
+    "📅 Расписание: звонки и уроки по дням, напоминания перед уроком.\n"
+    "📚 Домашка: просто напиши «Математика №12–15», бот найдёт следующий урок.\n"
+    "📷 Фото задания: пришли фото и выбери «Только решение» или «С объяснением по шагам». "
+    "ИИ ответит на том же языке, что и задание.\n"
+    "✅ Чек-лист: свои ежедневные дела.\n"
+    "⚙️ Настройки: город, класс, выходные.\n\n"
+    "Команды: /start (меню), /help (помощь), /id (твой Telegram ID)."
+)
+HELP_KB = kb([("✉️ Написать администратору", "support")], [MENU])
+
+
+@router.message(Command("help"))
+async def help_cmd(m: Message, state: FSMContext):
+    await state.clear()
+    await m.answer(HELP_TEXT, reply_markup=HELP_KB)
+
+
+@router.callback_query(F.data == "help")
+async def help_cb(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await edit(cb, HELP_TEXT, HELP_KB)
+
+
+@router.message(Command("id"))
+async def my_id(m: Message):
+    await m.answer(f"Твой Telegram ID: {m.from_user.id}")
+
+
+@router.callback_query(F.data == "support")
+async def support_start(cb: CallbackQuery, state: FSMContext):
+    if not ADMIN_ID:
+        return await edit(cb, "Связь с администратором пока не настроена.", kb([MENU]))
+    await state.set_state(S.support)
+    await edit(
+        cb,
+        "Напиши сообщение для администратора одним сообщением (можно с фото). Я передам его, ответ придёт сюда.",
+        kb([("❌ Отмена", "help")]),
+    )
+
+
+@router.message(S.support)
+async def support_in(m: Message, state: FSMContext):
+    await state.clear()
+    u = m.from_user
+    uname = f"@{u.username}" if u.username else "без username"
+    head = f"✉️ Сообщение от {u.full_name} ({uname}), ID {u.id}.\nЧтобы ответить, ответь (reply) на это сообщение или на текст ниже."
+    try:
+        head_msg = await m.bot.send_message(ADMIN_ID, head)
+        copy_msg = await m.bot.copy_message(ADMIN_ID, m.chat.id, m.message_id)
+    except Exception:
+        logging.exception("support send failed")
+        return await m.answer("⚠️ Не получилось отправить, попробуй позже.", reply_markup=kb([MENU]))
+    for mid in (head_msg.message_id, copy_msg.message_id):
+        db.execute("INSERT OR REPLACE INTO support VALUES(?,?)", (mid, u.id))
+    await m.answer("✅ Отправил администратору. Ответ придёт сюда.", reply_markup=kb([MENU]))
+
+
+async def is_support_reply(m: Message) -> bool:
+    """Ответ администратора (reply) на пересланное сообщение пользователя."""
+    if not ADMIN_ID or not m.from_user or m.from_user.id != ADMIN_ID or not m.reply_to_message:
+        return False
+    row = db.execute("SELECT 1 FROM support WHERE admin_msg_id=?", (m.reply_to_message.message_id,)).fetchone()
+    return row is not None
+
+
+@router.message(is_support_reply)
+async def admin_reply(m: Message):
+    row = db.execute("SELECT user_id FROM support WHERE admin_msg_id=?", (m.reply_to_message.message_id,)).fetchone()
+    try:
+        await m.bot.send_message(row["user_id"], "✉️ Ответ администратора:")
+        await m.bot.copy_message(row["user_id"], m.chat.id, m.message_id)
+    except Exception:
+        logging.exception("support reply failed")
+        return await m.answer("⚠️ Не удалось доставить ответ (возможно, пользователь заблокировал бота).")
+    await m.answer("✅ Ответ доставлен.")
 
 
 # ---------- вода ----------
@@ -386,7 +474,8 @@ async def settings(cb: CallbackQuery, state: FSMContext):
     text = (
         f"⚙️ Настройки\n\nНорма воды: {u['goal']} мл\nНапоминание об уроке: за {u['remind']} мин\n"
         f"Напоминание о домашке: в {u['hw_hour']}:00 и в 21:00\nКласс: {u['grade'] or 'не указан'}\n"
-        f"Часовой пояс: {u['tz']}"
+        f"Часовой пояс: {u['tz']}\n"
+        f"Вопрос о домашке после урока: {'выключен' if u['ask_hw'] == 0 else 'включён'}"
     )
     await edit(
         cb,
@@ -395,11 +484,19 @@ async def settings(cb: CallbackQuery, state: FSMContext):
             [("💧 Норма воды", "set_goal")],
             [("⏰ Напоминание об уроке", "set_rem")],
             [("📚 Время для домашки", "set_hw")],
+            [("📝 Вопрос после урока: вкл/выкл", "set_ask")],
             [("🎓 Класс", "set_grade"), ("🚫 Выходные", "set_hol")],
             [("🌍 Часовой пояс", "set_tz")],
             [MENU],
         ),
     )
+
+
+@router.callback_query(F.data == "set_ask")
+async def set_ask(cb: CallbackQuery, state: FSMContext):
+    u = user(cb.from_user.id)
+    db.execute("UPDATE users SET ask_hw=? WHERE user_id=?", (1 if u["ask_hw"] == 0 else 0, cb.from_user.id))
+    await settings(cb, state)
 
 
 @router.callback_query(F.data == "set_hw")
@@ -703,6 +800,25 @@ async def hw_done(cb: CallbackQuery):
 HW_AFTER = kb([("📚 Вся домашка", "hw")], [MENU])
 
 
+@router.callback_query(F.data.startswith("hq:"))
+async def hw_ask_yes(cb: CallbackQuery, state: FSMContext):
+    """Кнопка «Записать задание» под вопросом после урока: дальше работает обычная запись домашки."""
+    _, wd, num = cb.data.split(":")
+    row = db.execute(
+        "SELECT title FROM lessons WHERE user_id=? AND weekday=? AND num=?", (cb.from_user.id, int(wd), int(num))
+    ).fetchone()
+    if not row:
+        return await cb.answer("Не нашёл этот урок в расписании", show_alert=True)
+    await state.set_state(S.hw_task)
+    await state.update_data(subj=row["title"])
+    await edit(cb, f"✍️ Что задали по предмету «{row['title']}»? Напиши одним сообщением.", kb([("❌ Отмена", "menu")]))
+
+
+@router.callback_query(F.data == "hqn")
+async def hw_ask_no(cb: CallbackQuery):
+    await edit(cb, "Хорошо, ничего не записываю 👍", kb([MENU]))
+
+
 @router.message(S.hw_task)
 async def hw_task_in(m: Message, state: FSMContext):
     title = (await state.get_data())["subj"]
@@ -794,7 +910,9 @@ async def gemini(parts, system=None, json_mode=False):
 def tutor_prompt(grade, mode):
     who = f"ученику {grade} класса школы в Казахстане" if grade else "школьнику"
     base = (
-        f"Ты школьный репетитор. Помоги {who} с заданием на фото. Отвечай на языке задания (по умолчанию на русском). "
+        f"Ты школьный репетитор. Помоги {who} с заданием на фото. "
+        "Отвечай строго на том же языке, на котором написано задание на фото (русский, казахский, английский и т. д.), "
+        "включая пояснения и итоговый ответ. Если язык определить нельзя, отвечай на русском. "
         "Пиши простым текстом без Markdown и без LaTeX, формулы записывай обычными символами (x^2, 3/4, √). "
     )
     if mode == "solve":
@@ -1083,6 +1201,30 @@ async def check_reminders(bot: Bot):
                     )
                 except Exception:
                     logging.exception("send failed")
+        if u["ask_hw"] != 0:  # после последнего урока предмета за день спрашиваем, что задали
+            for r in rows:
+                if any(x["title"] == r["title"] and x["num"] > r["num"] for x in rows):
+                    continue
+                eh, em = map(int, r["end"].split(":"))
+                end = now.replace(hour=eh, minute=em, second=0, microsecond=0)
+                if not end <= now < end + timedelta(minutes=20):
+                    continue
+                key = (u["user_id"], now.date().isoformat(), r["title"], "after")
+                if key in sent:
+                    continue
+                sent.add(key)
+                try:
+                    await bot.send_message(
+                        u["user_id"],
+                        f"📝 Урок «{r['title']}» закончился. Что задали?\n"
+                        "Нажми кнопку или просто напиши задание, например: " + f"{r['title']} №12–15",
+                        reply_markup=kb(
+                            [("✍️ Записать задание", f"hq:{now.weekday()}:{r['num']}")],
+                            [("🙅 Ничего не задали", "hqn")],
+                        ),
+                    )
+                except Exception:
+                    logging.exception("after-lesson send failed")
         await hw_remind(bot, u, now)
     if len(sent) > 2000:
         sent.clear()
@@ -1102,6 +1244,16 @@ async def main():
     if not TOKEN:
         raise SystemExit("Задай переменную окружения BOT_TOKEN")
     bot = Bot(TOKEN)
+    try:  # список команд в меню Telegram
+        await bot.set_my_commands(
+            [
+                BotCommand(command="start", description="Главное меню"),
+                BotCommand(command="help", description="Помощь и связь с администратором"),
+                BotCommand(command="id", description="Мой Telegram ID"),
+            ]
+        )
+    except Exception:
+        logging.exception("set_my_commands failed")
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
     task = asyncio.create_task(reminder_loop(bot))
